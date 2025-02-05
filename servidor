@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+import asyncio
+from tcp import Servidor
+import re
+import textwrap
+
+nicknames = {}
+canais = {}
+
+#[user1] = [canal1,canal2,canal2] => guarda todos os canais que o usuario está
+nicknames_canais = {}
+
+def validar_nome(nome):
+    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
+
+
+def sair(conexao):
+
+    nickname = ''
+    
+
+    #conexao foi registrada => possui NICKNAME
+    if conexao in nicknames.values():
+        nickname = list(nicknames.keys())[list(nicknames.values()).index(conexao)]
+
+        #usuario conectado a algum canal
+        if nickname in nicknames_canais:
+            for i in nicknames_canais[nickname]:
+                canais[i].remove(conexao)
+                for j in canais[i]:
+                    j.enviar(b':%s QUIT :Connection closed\r\n' % nickname)
+
+            del nicknames_canais[nickname]
+
+        del nicknames[nickname]
+        
+        
+    
+    conexao.fechar()
+    
+
+def trata_nick(conexao, nickname):
+    if validar_nome(nickname):
+        if nickname.lower() in nicknames:
+            if conexao in nicknames.values():
+                nickAtual = list(nicknames.keys())[list(nicknames.values()).index(conexao)]
+                conexao.enviar(b":server 433 %s %s :Nickname is already in use\r\n"  % (nickAtual ,nickname))
+            else:
+                conexao.enviar(b":server 433 * %s :Nickname is already in use\r\n" % nickname)
+        else:
+            #já possui um nick => remove o antigo, coloca um novo
+            if conexao in nicknames.values():
+                nickAtual = list(nicknames.keys())[list(nicknames.values()).index(conexao)]
+                del nicknames[nickAtual] #deleta o nick antigo 
+                nicknames[(nickname).lower().rstrip(b'\r') ] =  conexao #coloca o novo
+                conexao.enviar(b":%s NICK %s\r\n" % (nickAtual,nickname))
+                
+            #não tem um nick => só atribui o [nick]=conexao
+            else:
+                nicknames[(nickname).lower().rstrip(b'\r') ] =  conexao
+                conexao.enviar(b':server 001 %s :Welcome\r\n' % nickname)
+                conexao.enviar(b':server 422 %s :MOTD File is missing\r\n' % nickname)
+    else:
+        conexao.enviar(b':server 432 * %s :Erroneous nickname\r\n' % nickname)
+
+def priv_message(conexao, nickname, mensagem):
+
+    #só pode mandar mensagem se já tiver registrado
+    if conexao in nicknames.values():
+        remetente = list(nicknames.keys())[list(nicknames.values()).index(conexao)] #pega o nick do remetente
+        
+
+        if b'#' in nickname:
+            #pode mandar msg pro canal apenas se estiver nele
+            if conexao in canais[nickname]:
+                for i in canais[nickname]:
+                    #não manda pra ele próprio
+                    if(i!=conexao):
+                        i.enviar(b':' + remetente + b' PRIVMSG ' + nickname + b' :' + mensagem + b'\r\n')
+        else:
+            #se o destinatario EXISTIR => se não, n faz nada
+            if nickname in nicknames:
+                destinario = nicknames[nickname] #conexao do destinatario
+                destinario.enviar(b':' + remetente + b' PRIVMSG ' + nickname + b' :' + mensagem + b'\r\n')
+
+def trata_canal(conexao, nomeCanal):
+
+    if conexao in nicknames.values():
+        lista = list()
+        lista.append(conexao)
+
+        nickname = list(nicknames.keys())[list(nicknames.values()).index(conexao)] #pega o nick de quem entrou
+
+        
+
+        #valida o nome do canal sem o #
+        if validar_nome(nomeCanal):
+            nome_completo = b'#'+nomeCanal #recria o nome completo do canal
+            
+            #armazena todos os canais que o usuario faz parte
+            todos_canais = list()
+            todos_canais.append(nome_completo)
+            
+            if nickname in nicknames_canais:
+                nicknames_canais[nickname].append(nome_completo)
+            else:
+                nicknames_canais[nickname] = todos_canais
+
+            #o canal já existe => coloca a conexao ao canal e envia que o usuario conectou para todos
+            if(nome_completo in canais):
+                canais[nome_completo].append(conexao)
+            #se não existe => cria o canal com uma lista (com a unica conexao)
+            else:
+                canais[nome_completo] = lista
+
+
+            
+
+            #envia mensagem para todos que o usuário entrou no canal
+            for i in canais[nome_completo]:
+                i.enviar(b":%s JOIN :%s\r\n" %(nickname,nome_completo))
+
+            #server 353 => mostra para o usuario que conectou no canal todos os membros
+            membros = []
+            for i in canais[nome_completo]:
+                membros.append(list(nicknames.keys())[list(nicknames.values()).index(i)]) #adiciona o nickname de todos os membros nessa lista
+
+            membros.sort()
+
+            #cria uma string dos membros => pra printar na mensagem
+            membros_string = " ".join(str(element) for element in membros).translate({ord(i): None for i in "b'"})
+
+            #quebra a string em no máximo 512 caracteres
+            wrapped = textwrap.wrap(membros_string,512)
+            
+            for i in wrapped:
+                print("I:", i)
+                conexao.enviar(b':server 353 %s = %s :%s\r\n' % (nickname, nome_completo,bytes(i,"utf-8")))
+
+            conexao.enviar(b':server 366 %s %s :End of /NAMES list.\r\n' % (nickname, nome_completo))
+        
+        else:
+            conexao.enviar(b':server 403 %s :No such channel\r\n' % (b'#'+nomeCanal))
+
+
+def trata_part(conexao, canal):
+    nickname = list(nicknames.keys())[list(nicknames.values()).index(conexao)]
+
+    canal_byte = b''+canal
+
+
+    for i in canais[canal]:
+        i.enviar(b':%s PART %s\r\n' %(nickname,canal) )
+
+    canais[canal].remove(conexao) #tira a conexao do canal específico
+    nicknames_canais[nickname].remove(canal_byte)
+
+       
+
+def dados_recebidos(conexao, dados):
+    if dados == b'':
+        return sair(conexao)
+
+    conexao.dadosResiduais += dados
+
+    mensagens = conexao.dadosResiduais.split(b'\n')
+
+    if(len(mensagens)>=2):
+        for i in range(0,(len(mensagens) - 1)):
+            if b'PING' in mensagens[i]:
+                conexao.enviar(b':server PONG server :' + mensagens[i].split(b' ', 1)[1] + b'\n')
+            if b'NICK' in mensagens[i]:
+                trata_nick(conexao, mensagens[i].split(b' ', 1)[1].rstrip(b'\r'))
+            if b'PRIVMSG' in mensagens[i]:
+                priv_message(conexao, mensagens[i].split(b' ')[1].rstrip(b'\r').lower(), mensagens[i].split(b' ')[2].strip(b':\r\n'))
+            if b'JOIN' in mensagens[i]:
+                  trata_canal(conexao, mensagens[i].split(b' ', 1)[1].strip(b'#\r\n').lower())
+            if b'PART' in mensagens[i]:
+                  trata_part(conexao, mensagens[i].split(b' ')[1].strip(b'\r\n').lower())
+
+    if(conexao.dadosResiduais[-1] == b'\n'):
+        if b'PING' in mensagens[i]:
+                conexao.enviar(b':server PONG server :' + mensagens[i].split(b' ', 1)[1] + b'\n')
+        if b'NICK' in mensagens[i]:
+            trata_nick(conexao, mensagens[i].split(b' ')[1].rstrip(b'\r'))
+        if b'PRIVMSG' in mensagens[i]:
+            priv_message(conexao, mensagens[i].split(b' ')[1].rstrip(b'\r').lower(),mensagens[i].split(b' ')[2].strip(b':\r\n'))
+        if b'JOIN' in mensagens[i]:
+            trata_canal(conexao, mensagens[i].split(b' ', 1)[1].strip(b'\r\n').lower())
+        if b'PART' in mensagens[i]:
+            trata_part(conexao, mensagens[i].split(b' ')[1].strip(b'\r\n').lower())
+    else:
+        conexao.dadosResiduais = mensagens[-1]
+
+
+    
+    print(conexao, dados)
+
+
+def conexao_aceita(conexao):
+    conexao.dadosResiduais = b''
+    print(conexao, 'nova conexão')
+    conexao.registrar_recebedor(dados_recebidos)
+
+
+servidor = Servidor(6667)
+servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
+asyncio.get_event_loop().run_forever()
